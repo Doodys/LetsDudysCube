@@ -52,6 +52,12 @@ void setup()
   pinMode(pin4,OUTPUT);
   pinMode(pin5,OUTPUT);
 
+  digitalWrite(pin2,HIGH);
+  digitalWrite(pin2,HIGH);
+  digitalWrite(pin3,HIGH);
+  digitalWrite(pin4,HIGH);
+  digitalWrite(pin5,HIGH);
+
   pinMode(deepSleepButton, INPUT);
 }
 
