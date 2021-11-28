@@ -3,18 +3,21 @@ using Windows.UI.Xaml;
 
 namespace LetsDudysCube.Helpers
 {
-    class CubeTimer
+    internal class CubeTimer
     {
+        public bool isStarted = false;
+
         /// <summary>
         /// Global counter that increments while the timer is active
         /// </summary>
         private TimeSpan totalElapsed = new TimeSpan(0);
+
         /// <summary>
         /// Save the last relevant point in time to compute the next elapsed increment
         /// </summary>
         private DateTime lastPointInTime = DateTime.MinValue;
 
-        private DispatcherTimer dispatcherTimer;
+        private readonly DispatcherTimer dispatcherTimer;
 
         public CubeTimer()
         {
@@ -27,11 +30,13 @@ namespace LetsDudysCube.Helpers
             dispatcherTimer.Tick += DispatcherTimeTicker;
             // reset lastPointInTime in order to skip time from when the timer was stopped
             lastPointInTime = DateTime.Now;
+            isStarted = true;
             dispatcherTimer.Start();
         }
 
         public void Stop()
         {
+            isStarted = false;
             dispatcherTimer.Stop();
         }
 
@@ -43,7 +48,7 @@ namespace LetsDudysCube.Helpers
         private void DispatcherTimeTicker(object sender, object o)
         {
             var nextPointInTime = DateTime.Now;
-            totalElapsed += (nextPointInTime - lastPointInTime);
+            totalElapsed += nextPointInTime - lastPointInTime;
             lastPointInTime = nextPointInTime;
         }
     }

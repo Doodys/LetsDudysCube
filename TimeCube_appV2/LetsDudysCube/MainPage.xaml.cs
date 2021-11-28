@@ -1,12 +1,14 @@
-﻿using LetsDudysCube.Helpers;
+﻿using LetsDudysCube.Enums;
+using LetsDudysCube.Helpers;
 using LetsDudysCube.Models;
 using MetroLog;
 using MetroLog.Targets;
 using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.Advertisement;
@@ -14,7 +16,9 @@ using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Devices.Enumeration;
 using Windows.Foundation;
 using Windows.Security.Cryptography;
+using Windows.Storage;
 using Windows.UI;
+using Windows.UI.Core;
 using Windows.UI.Popups;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
@@ -27,28 +31,38 @@ namespace LetsDudysCube
     /// </summary>
     public sealed partial class MainPage : Page
     {
-        private ILogger logger;
+        public static ActivityModelPreparation activityModelList = new(new CubeModel());
 
-        private DispatcherTimer connectionStatusTimerDevices;
-        private DispatcherTimer connectionStatusTimerConnection;
+        private Windows.UI.Xaml.DispatcherTimer connectionStatusTimerDevices;
+        private Windows.UI.Xaml.DispatcherTimer connectionStatusTimerConnection;
 
         private BluetoothLEDevice candidateToConnect;
         private DeviceInformation selectedDevice;
         private GattDeviceService gattService;
         private GattCharacteristicsResult gattCharacteristics;
         private GattCharacteristic gattCharacteristic;
-        private CubeModel cubeModel;
-        private ObservableCollection<ActivityModel> activityModels;
-        private BluetoothLEAdvertisementWatcher bleWatcher;
 
-        private Dictionary<ulong, DeviceInformation> foundDevices = new Dictionary<ulong, DeviceInformation>();
+        private readonly ILogger logger;
+        private readonly CubeModel cubeModel;
+        private readonly BluetoothLEAdvertisementWatcher bleWatcher;
+        private readonly Dictionary<ulong, DeviceInformation> foundDevices;
 
-        private bool ConnectionStatus = false;
-        private readonly string outputFile = "TimeCube_";
+        private readonly CubeTimer upperWallTimer;
+        private readonly CubeTimer leftWallTimer;
+        private readonly CubeTimer rightWallTimer;
+        private readonly CubeTimer lowerWallTimer;
+        private readonly CubeTimer backWallTimer;
+        private readonly CubeTimer frontWallTimer;
+
+        private bool connectionStatus = false;
+        private bool measurementStarted = false;
+        private const string OutputFile = "TimeCube_";
 
         public MainPage()
         {
             this.InitializeComponent();
+
+            foundDevices = new();
 
             bleWatcher = new BluetoothLEAdvertisementWatcher
             {
@@ -56,11 +70,17 @@ namespace LetsDudysCube
             };
 
             bleWatcher.Received += BleWatcher_Received;
-
             bleWatcher.Start();
 
             PrepareDevices();
             cubeModel = new CubeModel();
+
+            upperWallTimer = new CubeTimer();
+            leftWallTimer = new CubeTimer();
+            rightWallTimer = new CubeTimer();
+            lowerWallTimer = new CubeTimer();
+            backWallTimer = new CubeTimer();
+            frontWallTimer = new CubeTimer();
 
             LogManagerFactory.DefaultConfiguration.AddTarget(LogLevel.Trace, LogLevel.Fatal, new StreamingFileTarget());
             logger = LogManagerFactory.DefaultLogManager.GetLogger<MainPage>();
@@ -72,9 +92,12 @@ namespace LetsDudysCube
         {
             var device = await BluetoothLEDevice.FromBluetoothAddressAsync(args.BluetoothAddress);
 
+            if (device is null)
+                return;
+
             lock (foundDevices)
             {
-                if (!foundDevices.Any(di => di.Value.Name == device.Name) && !foundDevices.ContainsKey(args.BluetoothAddress))
+                if (foundDevices.All(di => di.Value.Name != device.Name) && !foundDevices.ContainsKey(args.BluetoothAddress))
                 {
                     foundDevices.Add(
                         args.BluetoothAddress,
@@ -91,6 +114,9 @@ namespace LetsDudysCube
 
             if (selectedDevice != null)
             {
+                textBox_IsPaired.Text = "Checking pairing status...";
+                textBox_IsPaired.Foreground = new SolidColorBrush(Colors.DarkSlateBlue);
+
                 try
                 {
                     candidateToConnect = await BluetoothLEDevice.FromBluetoothAddressAsync
@@ -99,7 +125,7 @@ namespace LetsDudysCube
                     );
 
                     if (candidateToConnect == null)
-                        throw new NullReferenceException($"Device: {candidateToConnect.Name}");
+                        throw new NullReferenceException(nameof(candidateToConnect));
                 }
                 catch (NullReferenceException ex)
                 {
@@ -111,20 +137,16 @@ namespace LetsDudysCube
 
                     return;
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is System.FormatException or System.OverflowException)
                 {
-                    if (ex is System.FormatException || ex is System.OverflowException)
-                    {
-                        var dialog = new MessageDialog($"Problem with getting BLE address from device\n{ex.Message}", "Error");
-                        await dialog.ShowAsync();
+                    var dialog = new MessageDialog($"Problem with getting BLE address from device\n{ex.Message}",
+                        "Error");
+                    await dialog.ShowAsync();
 
-                        button_Pair.IsEnabled = false;
-                        button_Connect.IsEnabled = false;
+                    button_Pair.IsEnabled = false;
+                    button_Connect.IsEnabled = false;
 
-                        return;
-                    }
-
-                    throw;
+                    return;
                 }
 
                 if (!candidateToConnect.DeviceInformation.Pairing.IsPaired)
@@ -166,14 +188,29 @@ namespace LetsDudysCube
             if (candidateToConnect == null)
                 throw new ArgumentNullException(nameof(candidateToConnect));
 
-            var gattServices = await candidateToConnect.GetGattServicesAsync();
+            GattDeviceServicesResult gattServices = null;
 
-            if (gattServices == null)
+            try
             {
-                var dialog = new MessageDialog($"Problem with connecting. Cannot get proper Gatt Service from the device.", "Error");
-                await dialog.ShowAsync();
+                textBox_IsPaired.Text = "Connecting...";
+                textBox_IsPaired.Foreground = new SolidColorBrush(Colors.DodgerBlue);
 
-                return;
+                gattServices = await candidateToConnect.GetGattServicesAsync();
+
+                if (gattServices == null)
+                {
+                    var dialog =
+                        new MessageDialog("Problem with connecting. Cannot get proper Gatt Service from the device.",
+                            "Error");
+                    await dialog.ShowAsync();
+
+                    throw new Exception();
+                }
+            }
+            catch (Exception)
+            {
+                textBox_IsPaired.Text = "Error";
+                textBox_IsPaired.Foreground = new SolidColorBrush(Colors.DarkRed);
             }
 
             bleWatcher.Stop();
@@ -183,49 +220,67 @@ namespace LetsDudysCube
             await PrepareGattDescriptorForReadingNotifications();
         }
 
-        private void Charac_ValueChanged(GattCharacteristic sender, GattValueChangedEventArgs args)
+        private void Character_ValueChanged(GattCharacteristic sender, GattValueChangedEventArgs args)
         {
             CryptographicBuffer.CopyToByteArray(args.CharacteristicValue, out byte[] data);
+
             try
             {
                 var notifyMessage = BitConverter.ToString(data);
-                logger.Trace($"Hex value from notification: {notifyMessage}");
+
+                if (!int.TryParse(notifyMessage, out var parsedMessage))
+                    return;
+
+                logger.Trace($"Hex value from notification: {parsedMessage}");
+
+                if (measurementStarted)
+                {
+                    var result = Windows.ApplicationModel.Core.CoreApplication.MainView.CoreWindow.Dispatcher.RunAsync(CoreDispatcherPriority.Normal,
+                        () => UpdateTime(parsedMessage)).AsTask();
+                }
             }
             catch (ArgumentException) { }
         }
 
         private void TextBox_Up_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            cubeModel.UpperWall = TextBox_Up.Text;
-        }
+            => cubeModel.UpperWall = TextBox_Up.Text;
 
         private void TextBox_Front_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            cubeModel.FrontWall = TextBox_Front.Text;
-        }
+            => cubeModel.FrontWall = TextBox_Front.Text;
 
         private void TextBox_Right_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            cubeModel.RightWall = TextBox_Right.Text;
-        }
+            => cubeModel.RightWall = TextBox_Right.Text;
 
         private void TextBox_Back_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            cubeModel.BackWall = TextBox_Back.Text;
-        }
+            => cubeModel.BackWall = TextBox_Back.Text;
 
         private void TextBox_Left_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            cubeModel.LeftWall = TextBox_Left.Text;
-        }
+            => cubeModel.LeftWall = TextBox_Left.Text;
 
         private void TextBox_Down_TextChanged(object sender, TextChangedEventArgs e)
+            => cubeModel.BelowWall = TextBox_Down.Text;
+
+        private async void Button_OutputDirectory_Click(object sender, RoutedEventArgs e)
         {
-            cubeModel.BelowWall = TextBox_Down.Text;
+            var folderPicker = new Windows.Storage.Pickers.FolderPicker
+            {
+                SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.Desktop
+            };
+            folderPicker.FileTypeFilter.Add("*");
+
+            var folder = await folderPicker.PickSingleFolderAsync();
+
+            if (folder == null)
+                return;
+
+            Windows.Storage.AccessCache.StorageApplicationPermissions.FutureAccessList.AddOrReplace(
+                "PickedFolderToken", folder);
+
+            cubeModel.OutputDirectory = folder.Path;
+            Button_OutputDirectory.IsEnabled = false;
         }
 
-        #endregion
-
+        #endregion Events
 
         #region Private methods
 
@@ -258,59 +313,63 @@ namespace LetsDudysCube
 
         private async void HandlerConnectionStatusTimer_Tick(object sender, object o)
         {
-            if (candidateToConnect != null)
+            if (candidateToConnect == null)
+                return;
+
+            if (candidateToConnect.ConnectionStatus.Equals(BluetoothConnectionStatus.Connected))
             {
-                if (candidateToConnect.ConnectionStatus.Equals(BluetoothConnectionStatus.Connected))
+                if (!connectionStatus)
                 {
-                    if (!ConnectionStatus)
-                    {
-                        gattCharacteristic.ValueChanged -= Charac_ValueChanged;
-                        await PrepareGattDescriptorForReadingNotifications();
-                        logger.Trace($"Connected");
-                    }
-
-                    textBox_IsPaired.Text = "Device is connected";
-                    textBox_IsPaired.Foreground = new SolidColorBrush(Colors.DeepSkyBlue);
-
-                    SetTextBoxComponentsStateOnWalls(true);                  
-                    ConnectionStatus = true;
+                    gattCharacteristic.ValueChanged -= Character_ValueChanged;
+                    await PrepareGattDescriptorForReadingNotifications();
+                    logger.Trace($"Connected");
                 }
-                else
+
+                textBox_IsPaired.Text = "Device is connected";
+                textBox_IsPaired.Foreground = new SolidColorBrush(Colors.DeepSkyBlue);
+
+                SetTextBoxComponentsStateOnWalls(true);
+                connectionStatus = true;
+            }
+            else
+            {
+                if (connectionStatus)
                 {
-                    if (ConnectionStatus)
-                    {
-                        logger.Warn($"Stopped receiving values from a device.");
-                        logger.Trace($"Disconnected");
-                    }
-
-                    textBox_IsPaired.Text = "Connecting...";
-                    textBox_IsPaired.Foreground = new SolidColorBrush(Colors.DodgerBlue);
-
-                    SetTextBoxComponentsStateOnWalls(false);
-                    
-                    ConnectionStatus = false;
-
-                    gattCharacteristic.ValueChanged -= Charac_ValueChanged;
+                    logger.Warn($"Stopped receiving values from a device.");
+                    logger.Trace($"Disconnected");
                 }
+
+                textBox_IsPaired.Text = "Connecting...";
+                textBox_IsPaired.Foreground = new SolidColorBrush(Colors.DodgerBlue);
+
+                SetTextBoxComponentsStateOnWalls(false);
+
+                connectionStatus = false;
+
+                gattCharacteristic.ValueChanged -= Character_ValueChanged;
             }
         }
 
         private void PrepareActivityNameListBox()
         {
-            ListBox_ActivityName.ItemsSource = activityModels;
+            if (activityModelList == null)
+                return;
+
+            _ = Windows.ApplicationModel.Core.CoreApplication.MainView.CoreWindow.Dispatcher
+                .RunAsync(
+                    CoreDispatcherPriority.Normal,
+                    agileCallback: () => ListBox_ActivityName.ItemsSource = activityModelList
+                    );
         }
 
         private void PrepareDevices()
         {
-            if (foundDevices.Any())
-            {
-                var devicesInfo = new List<DeviceInformation>();
+            if (!foundDevices.Any())
+                return;
 
-                foreach (var device in foundDevices)
-                    devicesInfo.Add(device.Value);
+            var devicesInfo = foundDevices.Select(device => device.Value).ToList();
 
-                comboBox_Devices.ItemsSource = devicesInfo.Where(di => !string.IsNullOrEmpty(di.Name));
-            }
+            comboBox_Devices.ItemsSource = devicesInfo.Where(di => !string.IsNullOrEmpty(di.Name));
         }
 
         private async void PairDevices()
@@ -353,7 +412,7 @@ namespace LetsDudysCube
             //so we get here for custom pairing request.
             //this is the magic place where your pin goes.
             //my device actually does not require a pin but
-            //windows requires at least a "0".  So this solved 
+            //windows requires at least a "0".  So this solved
             //it.  This does not pull up the Windows UI either.
             DPR.Accept("0");
         }
@@ -368,25 +427,29 @@ namespace LetsDudysCube
             TextBox_Down.IsEnabled = state;
         }
 
-        private void SaveOutputFile()
+        private async void SaveOutputFile()
         {
-            var path = $@"{cubeModel.OutputDirectory}\\{outputFile}{DateTime.Now.ToString(@"ddmmyyyyhhmmss")}.txt";
+            var outputFileName = string.Concat(OutputFile, DateTime.Now.ToString("yyyyMMddHHmmss"), ".txt");
 
-            if (!File.Exists(path))
-            {
-                using (StreamWriter sw = File.CreateText(path))
-                {
-                    foreach (var activity in activityModels)
-                    {
-                        sw.WriteLine($"{activity.ActivityName} : {activity.TimeOutput}");
-                    }
-                }
-            }
+            StorageFolder storageFolder =
+                await StorageFolder.GetFolderFromPathAsync(cubeModel.OutputDirectory);
+            StorageFile sampleFile =
+                await storageFolder.CreateFileAsync(outputFileName,
+                    CreationCollisionOption.ReplaceExisting);
+
+            List<string> outputData = activityModelList.Select(activity => $"{activity.ActivityName} : {activity.TimeOutput}").ToList();
+
+            await Windows.Storage.FileIO.WriteLinesAsync(sampleFile, outputData);
         }
 
         private async Task PrepareGattAndBufferForApp(GattDeviceServicesResult gattServices)
         {
-            gattService = gattServices.Services.Last(); //last service on the list is our main service           
+            if (gattServices is null)
+            {
+                throw new ArgumentNullException(nameof(gattServices));
+            }
+
+            gattService = gattServices.Services.Last(); //last service on the list is our main service
             gattService.Session.MaintainConnection = true;
             gattCharacteristics = await gattService.GetCharacteristicsAsync(); //gattService.GetCharacteristicsForUuidAsync(gattService.Uuid);
             gattCharacteristic = gattCharacteristics.Characteristics.FirstOrDefault
@@ -409,9 +472,211 @@ namespace LetsDudysCube
                 descriptorWriteResult = await gattCharacteristic.WriteClientCharacteristicConfigurationDescriptorAsync(descriptorValue);
             }
 
-            gattCharacteristic.ValueChanged += Charac_ValueChanged;
+            gattCharacteristic.ValueChanged += Character_ValueChanged;
         }
 
-        #endregion
+        private async Task InitializeStart()
+        {
+            var validationMessage = ValidateWindowControls();
+
+            if (validationMessage.Length > 0)
+            {
+                var dialog =
+                    new MessageDialog(validationMessage.ToString(),
+                        "Error");
+                await dialog.ShowAsync();
+            }
+            else
+            {
+                measurementStarted = true;
+                SetTextBoxComponentsStateOnWalls(false);
+                leftWallTimer.Start();
+            }
+        }
+
+        private void InitializeStop()
+        {
+            measurementStarted = false;
+
+            upperWallTimer.Stop();
+            leftWallTimer.Stop();
+            rightWallTimer.Stop();
+            lowerWallTimer.Stop();
+            backWallTimer.Stop();
+            frontWallTimer.Stop();
+
+            SuspendDeviceConnectionAndServices();
+
+            SaveOutputFile();
+            //RestartTimeCube();
+        }
+
+        private void SuspendDeviceConnectionAndServices()
+        {
+            if (gattService == null || !gattService.Session.MaintainConnection)
+                return;
+
+            gattService.Session.MaintainConnection = false;
+            gattService.Session.Dispose();
+            gattService!.Dispose();
+            gattService = null;
+
+            var status = gattCharacteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue.None);
+
+            candidateToConnect!.Dispose();
+            candidateToConnect = null;
+        }
+
+        private StringBuilder ValidateWindowControls()
+        {
+            var validationMessage = new StringBuilder();
+
+            if (string.IsNullOrEmpty(cubeModel.OutputDirectory))
+                validationMessage.AppendLine("You have to choose output directory");
+
+            if (string.IsNullOrEmpty(TextBox_Up.Text))
+                validationMessage.AppendLine("You have to choose name for upper wall");
+
+            if (string.IsNullOrEmpty(TextBox_Left.Text))
+                validationMessage.AppendLine("You have to choose name for left wall");
+
+            if (string.IsNullOrEmpty(TextBox_Right.Text))
+                validationMessage.AppendLine("You have to choose name for right wall");
+
+            if (string.IsNullOrEmpty(TextBox_Down.Text))
+                validationMessage.AppendLine("You have to choose name for lower wall");
+
+            if (string.IsNullOrEmpty(TextBox_Front.Text))
+                validationMessage.AppendLine("You have to choose name for front wall");
+
+            if (string.IsNullOrEmpty(TextBox_Back.Text))
+                validationMessage.AppendLine("You have to choose name for back wall");
+
+            return validationMessage;
+        }
+
+        private void UpdateTime(int message)
+        {
+            if (!measurementStarted)
+                return;
+
+            switch (message)
+            {
+                case (int)PositionEnum.Left:
+                    upperWallTimer.Stop();
+                    rightWallTimer.Stop();
+                    lowerWallTimer.Stop();
+                    backWallTimer.Stop();
+                    frontWallTimer.Stop();
+                    if (!leftWallTimer.isStarted)
+                    {
+                        leftWallTimer.Start();
+                    }
+                    UpdateActivityModel(cubeModel.LeftWall, leftWallTimer);
+                    break;
+
+                case (int)PositionEnum.Right:
+                    upperWallTimer.Stop();
+                    leftWallTimer.Stop();
+                    lowerWallTimer.Stop();
+                    backWallTimer.Stop();
+                    frontWallTimer.Stop();
+                    if (!rightWallTimer.isStarted)
+                    {
+                        rightWallTimer.Start();
+                    }
+                    UpdateActivityModel(cubeModel.RightWall, rightWallTimer);
+                    break;
+
+                case (int)PositionEnum.Up:
+                    leftWallTimer.Stop();
+                    rightWallTimer.Stop();
+                    lowerWallTimer.Stop();
+                    backWallTimer.Stop();
+                    frontWallTimer.Stop();
+                    if (!upperWallTimer.isStarted)
+                    {
+                        upperWallTimer.Start();
+                    }
+                    UpdateActivityModel(cubeModel.UpperWall, upperWallTimer);
+                    break;
+
+                case (int)PositionEnum.Down:
+                    upperWallTimer.Stop();
+                    leftWallTimer.Stop();
+                    rightWallTimer.Stop();
+                    backWallTimer.Stop();
+                    frontWallTimer.Stop();
+                    if (!lowerWallTimer.isStarted)
+                    {
+                        lowerWallTimer.Start();
+                    }
+                    UpdateActivityModel(cubeModel.BelowWall, lowerWallTimer);
+                    break;
+
+                case (int)PositionEnum.Back:
+                    upperWallTimer.Stop();
+                    leftWallTimer.Stop();
+                    rightWallTimer.Stop();
+                    lowerWallTimer.Stop();
+                    frontWallTimer.Stop();
+                    if (!backWallTimer.isStarted)
+                    {
+                        backWallTimer.Start();
+                    }
+                    UpdateActivityModel(cubeModel.BackWall, backWallTimer);
+                    break;
+
+                case (int)PositionEnum.Front:
+                    upperWallTimer.Stop();
+                    leftWallTimer.Stop();
+                    rightWallTimer.Stop();
+                    lowerWallTimer.Stop();
+                    backWallTimer.Stop();
+                    if (!frontWallTimer.isStarted)
+                    {
+                        frontWallTimer.Start();
+                    }
+                    UpdateActivityModel(cubeModel.FrontWall, frontWallTimer);
+                    break;
+
+                default:
+                    upperWallTimer.Stop();
+                    leftWallTimer.Stop();
+                    rightWallTimer.Stop();
+                    lowerWallTimer.Stop();
+                    backWallTimer.Stop();
+                    frontWallTimer.Stop();
+                    break;
+            }
+        }
+
+        private void UpdateActivityModel(string name, CubeTimer wallTimer)
+        {
+            var activity = activityModelList.FirstOrDefault(am => am.ActivityName.Equals(name));
+
+            if (activity == null)
+                return;
+
+            activity.TimeSpent = wallTimer.TimerOutput();
+            activity.TimeOutput = activity.TimeSpent.ToString(@"hh\:mm\:ss");
+            ListBox_ActivityName.ItemsSource = activityModelList;
+        }
+
+        #endregion Private methods
+
+        private void Button_Click(object sender, RoutedEventArgs e)
+        {
+            cubeModel.OutputDirectory = AppContext.BaseDirectory;
+            activityModelList.Clear();
+            activityModelList = new ActivityModelPreparation(cubeModel);
+            _ = InitializeStart();
+        }
+
+        private void testbutton2_Click(object sender, RoutedEventArgs e)
+        {
+            InitializeStop();
+        }
     }
 }
